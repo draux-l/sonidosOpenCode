@@ -1,0 +1,13 @@
+{
+  "name": "sonidos-opencode",
+  "version": "1.1.0",
+  "description": "Passive Windows notification plugin for OpenCode: distinct sounds and toasts for responses, task completion, errors, permission asks, and question asks. Zero runtime dependencies.",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test tests/sonido.test.ts"
+  },
+  "engines": {
+    "node": ">=22.18"
+  }
+}

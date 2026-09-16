@@ -1,0 +1,16 @@
+# Dependencies
+node_modules/
+
+# Runtime artifacts and logs
+*.log
+sonido.log
+
+# OpenCode local state
+.opencode/
+
+# Local tooling state (skill registries, caches) — machine-specific, never public
+.atl/
+
+# OS noise
+Thumbs.db
+.DS_Store
