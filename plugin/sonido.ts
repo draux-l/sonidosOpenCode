@@ -1,16 +1,17 @@
 /**
  * Sonido — passive OpenCode notification plugin for Windows 11.
  *
- * This file is the OpenCode plugin entry point. It exports ONLY a plugin factory
- * function so the OpenCode loader does not reject it. All logic is inlined
- * locally (no named exports). The testable core lives in sonido-core.ts.
+ * This file is the OpenCode plugin entry point for the OpenCode 2.x plugin API.
+ * It exports ONLY a default `Plugin.define({ id, setup })` definition: the 2.x
+ * loader rejects a plugin with any other export. All logic is inlined locally
+ * (no named exports) and the testable core lives in sonido-core.ts.
  */
-import type { Plugin } from "@opencode-ai/plugin"
+import { Plugin } from "@opencode/plugin"
 import { spawn } from "node:child_process"
 import { appendFileSync } from "node:fs"
 import { fileURLToPath } from "node:url"
 
-const VERSION = "1.1.0"
+const VERSION = "2.0.0"
 
 type NotifyKind = "completion" | "response" | "attention" | "error"
 
@@ -93,6 +94,114 @@ function truncate(s: string, max: number): string {
   let cut = max - 1
   while (cut > 0 && s.charCodeAt(cut - 1) >= 0xd800 && s.charCodeAt(cut - 1) <= 0xdbff) cut--
   return s.slice(0, cut) + "…"
+}
+
+// ─── V2 (OpenCode 2.x) → core translation ───────────────────────────────────
+
+/** Envelope delivered by ctx.event.subscribe() in OpenCode 2.x. */
+interface V2Event {
+  type?: unknown
+  data?: unknown
+}
+
+/** An event in the `{ type, properties }` shape SonidoCore.handleEvent takes. */
+interface CoreEvent {
+  type: string
+  properties: Record<string, unknown>
+}
+
+function asRecord(value: unknown): Record<string, any> {
+  return value !== null && typeof value === "object" ? (value as Record<string, any>) : {}
+}
+
+/** 2.x errors are `{ type, message, status? }`; the core reads `{ name, message }`. */
+function translateError(error: unknown): { name?: string; message?: string } {
+  const err = asRecord(error)
+  return { name: asString(err.type), message: asString(err.message) }
+}
+
+/**
+ * The question text for a form: the form title, else the first field's title or
+ * description. Returns undefined when the form carries no usable text.
+ */
+function formQuestionText(form: Record<string, any>): string | undefined {
+  const title = asString(form.title)
+  if (title) return title
+  const fields = Array.isArray(form.fields) ? form.fields : []
+  for (const field of fields) {
+    const f = asRecord(field)
+    const text = asString(f.title) ?? asString(f.description)
+    if (text) return text
+  }
+  return undefined
+}
+
+/**
+ * Translates one OpenCode 2.x event into the `{ type, properties }` contract
+ * handleEvent consumes. Returns null for every event Sonido has no behavior for.
+ */
+function translateEvent(event: V2Event): CoreEvent | null {
+  const type = asString(event?.type)
+  if (!type) return null
+  const data = asRecord(event?.data)
+
+  switch (type) {
+    case "session.idle": {
+      const sessionID = asString(data.sessionID)
+      if (!sessionID) return null
+      return { type: "session.idle", properties: { sessionID } }
+    }
+    case "session.status": {
+      const sessionID = asString(data.sessionID)
+      if (!sessionID) return null
+      return { type: "session.status", properties: { sessionID, status: data.status } }
+    }
+    case "session.created": {
+      // 2.x carries the session record in `data` itself: `sessionID` is the
+      // created session, and `parentID` / `title` are optional.
+      const id = asString(data.sessionID)
+      if (!id) return null
+      return {
+        type: "session.created",
+        properties: { info: { id, parentID: data.parentID, title: data.title } },
+      }
+    }
+    case "session.deleted": {
+      const id = asString(data.sessionID)
+      if (!id) return null
+      return { type: "session.deleted", properties: { info: { id } } }
+    }
+    case "session.execution.failed":
+    case "session.step.failed": {
+      // 2.x replaced `session.error` with these two failure events.
+      const sessionID = asString(data.sessionID)
+      if (!sessionID) return null
+      return { type: "session.error", properties: { sessionID, error: translateError(data.error) } }
+    }
+    case "permission.asked": {
+      // 2.x calls the permission name `action` and its patterns `resources`.
+      const id = asString(data.id)
+      if (!id) return null
+      return {
+        type: "permission.asked",
+        properties: { id, sessionID: data.sessionID, permission: data.action, patterns: data.resources },
+      }
+    }
+    case "form.created": {
+      // 2.x renamed the question system to forms; the core's question.asked
+      // branch already renders the first question text.
+      const form = asRecord(data.form)
+      const id = asString(form.id)
+      if (!id) return null
+      const text = formQuestionText(form)
+      return {
+        type: "question.asked",
+        properties: { id, sessionID: form.sessionID, questions: text ? [{ question: text }] : [] },
+      }
+    }
+    default:
+      return null
+  }
 }
 
 class SonidoCore {
@@ -484,20 +593,47 @@ function resolveScriptPath(moduleURL: string): string {
   return ""
 }
 
-export default async (): ReturnType<Plugin> => {
-  const core = new SonidoCore({
-    notify: createNotifier({ scriptPath: resolveScriptPath(import.meta.url) }),
-  })
-  defaultLog("SonidoPlugin initialized v" + VERSION)
-  return {
-    "chat.message": async (input) => {
-      core.onChatMessage(input.sessionID)
-    },
-    "tool.execute.after": async (input, output) => {
-      core.onToolExecute(input.sessionID, input.tool, input.args, output)
-    },
-    event: async ({ event }) => {
-      core.handleEvent(event)
-    },
-  }
-}
+export default Plugin.define({
+  id: "sonido",
+  async setup(ctx) {
+    const core = new SonidoCore({
+      notify: createNotifier({ scriptPath: resolveScriptPath(import.meta.url) }),
+    })
+    defaultLog("SonidoPlugin initialized v" + VERSION)
+
+    const abort = new AbortController()
+
+    const toolHook = await ctx.tool.hook("execute.after", (call) => {
+      core.onToolExecute(
+        call.sessionID,
+        call.tool,
+        call.input,
+        call.status === "completed" ? call.result : undefined,
+      )
+    })
+
+    // 2.x has no "chat.message" hook: a new prompt clears the completion flag.
+    const promptHook = await ctx.session.hook("prompt", (call) => {
+      core.onChatMessage(call.sessionID)
+    })
+
+    // The event stream never ends, so it must never block setup().
+    const pump = async (): Promise<void> => {
+      try {
+        for await (const event of ctx.event.subscribe({ signal: abort.signal })) {
+          const translated = translateEvent(event)
+          if (translated) core.handleEvent(translated)
+        }
+      } catch (err: any) {
+        defaultLog(`event stream ended: ${err?.message || err}`)
+      }
+    }
+    void pump()
+
+    return async () => {
+      abort.abort()
+      await toolHook.dispose()
+      await promptHook.dispose()
+    }
+  },
+})

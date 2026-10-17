@@ -30,6 +30,7 @@ import {
   createNotifier,
   resolveScriptPath,
   resolveLogPath,
+  translateEvent,
   type Notification,
 } from "../plugin/sonido-core.ts"
 
@@ -107,10 +108,21 @@ function collect(core: SonidoCore, events: unknown[]): (Notification | null)[] {
   return events.map((evt) => core.handleEvent(evt))
 }
 
+// OpenCode 2.x delivers `{ id, created, type, data }` payloads; translateEvent
+// maps them onto the `{ type, properties }` contract handleEvent already takes.
+function v2Event(type: string, data: Record<string, unknown>): unknown {
+  return { id: "evt_" + type, created: 1_700_000_000_000, type, data }
+}
+
+function handleV2(core: SonidoCore, event: unknown): Notification | null {
+  const translated = translateEvent(event as any)
+  return translated ? core.handleEvent(translated) : null
+}
+
 // ─── Version / structure ────────────────────────────────────────────────────
 
 test("plugin is versioned", () => {
-  assert.equal(VERSION, "1.1.0")
+  assert.equal(VERSION, "2.0.0")
 })
 
 test("resolveScriptPath points at the sibling PowerShell script", () => {
@@ -269,6 +281,173 @@ test("question.asked is an attention request with question text", () => {
   assert.ok(n)
   assert.equal(n!.kind, "attention")
   assert.match(n!.body, /Continue\?/)
+})
+
+// ─── V2 (OpenCode 2.x) event translation ────────────────────────────────────
+//
+// OpenCode 2.x renamed the event envelope fields (properties -> data) and some
+// events. translateEvent() normalizes both onto the core's contract, so the
+// engine and its tests stay untouched.
+
+test("V2 session.idle translates to the response sound", () => {
+  const core = new SonidoCore({ log: noopLog })
+  const n = handleV2(core, v2Event("session.idle", { sessionID: "s1" }))
+  assert.ok(n)
+  assert.equal(n!.kind, "response")
+})
+
+test("V2 session.status idle translates to the response sound", () => {
+  const core = new SonidoCore({ log: noopLog })
+  const n = handleV2(core, v2Event("session.status", { sessionID: "s1", status: { type: "idle" } }))
+  assert.ok(n)
+  assert.equal(n!.kind, "response")
+})
+
+test("V2 session.created learns the session id, parentID and title from data", () => {
+  const core = new SonidoCore({ log: noopLog })
+  // A child session (parentID) is a subagent: its idle is suppressed.
+  assert.equal(
+    handleV2(core, v2Event("session.created", { sessionID: "child", parentID: "root", slug: "kid", title: "Review the diff (subagent)" })),
+    null,
+  )
+  assert.equal(handleV2(core, v2Event("session.idle", { sessionID: "child" })), null)
+  // A top-level session with a title enriches a completion notification body.
+  handleV2(core, v2Event("session.created", { sessionID: "s1", slug: "s1", title: "Fix the flaky test" }))
+  core.onToolExecute("s1", "task")
+  const n = handleV2(core, v2Event("session.idle", { sessionID: "s1" }))
+  assert.ok(n)
+  assert.equal(n!.kind, "completion")
+  assert.equal(n!.body, "Fix the flaky test")
+})
+
+test("V2 session.deleted forgets the session record", () => {
+  const core = new SonidoCore({ log: noopLog })
+  handleV2(core, v2Event("session.created", { sessionID: "child", parentID: "root", slug: "kid" }))
+  assert.equal(handleV2(core, v2Event("session.idle", { sessionID: "child" })), null)
+  assert.equal(handleV2(core, v2Event("session.deleted", { sessionID: "child" })), null)
+  // No longer known as a subagent -> treated as top-level
+  assert.ok(handleV2(core, v2Event("session.idle", { sessionID: "child" })))
+})
+
+test("V2 session.execution.failed emits the error sound with the structured error", () => {
+  const core = new SonidoCore({ log: noopLog, limits: permissiveLimits })
+  const n = handleV2(
+    core,
+    v2Event("session.execution.failed", {
+      sessionID: "s1",
+      error: { type: "ProviderError", message: "rate limited", status: 429 },
+    }),
+  )
+  assert.ok(n)
+  assert.equal(n!.kind, "error")
+  assert.equal(n!.title, "OpenCode error")
+  assert.match(n!.body, /ProviderError/)
+  assert.match(n!.body, /rate limited/)
+  // A failure with no structured error still notifies.
+  const bare = handleV2(core, v2Event("session.execution.failed", { sessionID: "s2" }))
+  assert.ok(bare)
+  assert.equal(bare!.kind, "error")
+  assert.equal(bare!.body, "Session error")
+})
+
+test("V2 session.step.failed emits the error sound for the failed step", () => {
+  const core = new SonidoCore({ log: noopLog })
+  const n = handleV2(
+    core,
+    v2Event("session.step.failed", {
+      sessionID: "s1",
+      assistantMessageID: "msg_1",
+      error: { type: "OutputLengthError", message: "output too long" },
+    }),
+  )
+  assert.ok(n)
+  assert.equal(n!.kind, "error")
+  assert.match(n!.body, /OutputLengthError/)
+  assert.match(n!.body, /output too long/)
+})
+
+test("V2 permission.asked is an attention request with the action and its resources", () => {
+  const core = new SonidoCore({ log: noopLog })
+  const n = handleV2(
+    core,
+    v2Event("permission.asked", {
+      id: "p1",
+      sessionID: "s1",
+      action: "bash",
+      resources: ["git commit -m test"],
+      source: { type: "tool", messageID: "msg_1", id: "call_1" },
+    }),
+  )
+  assert.ok(n)
+  assert.equal(n!.kind, "attention")
+  assert.equal(n!.title, "Permission request")
+  assert.match(n!.body, /bash/)
+  assert.match(n!.body, /git commit/)
+})
+
+test("V2 form.created is an attention request showing the form title, else the first field title", () => {
+  const core = new SonidoCore({ log: noopLog, limits: permissiveLimits })
+  const titled = handleV2(
+    core,
+    v2Event("form.created", {
+      form: {
+        id: "f1",
+        sessionID: "s1",
+        title: "Continue with the refactor?",
+        fields: [{ key: "answer", type: "string", title: "Yes or no?" }],
+      },
+    }),
+  )
+  assert.ok(titled)
+  assert.equal(titled!.kind, "attention")
+  assert.equal(titled!.title, "OpenCode needs your input")
+  assert.match(titled!.body, /Continue with the refactor\?/)
+  const untitled = handleV2(
+    core,
+    v2Event("form.created", {
+      form: {
+        id: "f2",
+        sessionID: "s1",
+        fields: [{ key: "scope", type: "string", title: "Which files?" }],
+      },
+    }),
+  )
+  assert.ok(untitled)
+  assert.match(untitled!.body, /Which files\?/)
+})
+
+test("events that 2.x dropped translate to nothing", () => {
+  const core = new SonidoCore({ log: noopLog })
+  const events = [
+    v2Event("session.error", { sessionID: "s1", error: { name: "APIError", message: "boom" } }),
+    v2Event("question.asked", { id: "q1", sessionID: "s1", questions: ["Continue?"] }),
+    v2Event("todo.updated", { sessionID: "s1", todos: [{ status: "completed" }] }),
+    v2Event("session.updated", { info: { id: "s1" } }),
+    v2Event("permission.replied", { permissionID: "p1" }),
+  ]
+  for (const event of events) assert.equal(translateEvent(event as any), null, String((event as any).type))
+  assert.deepEqual(events.map((event) => handleV2(core, event)), events.map(() => null))
+})
+
+test("malformed V2 envelopes are ignored without throwing", () => {
+  const core = new SonidoCore({ log: noopLog })
+  const events: unknown[] = [
+    null,
+    undefined,
+    42,
+    "session.idle",
+    {},
+    { type: "session.idle" }, // no data
+    { type: "session.idle", data: {} }, // no sessionID
+    { type: "session.status", data: { sessionID: "s1" } }, // no status
+    { type: "session.created", data: {} }, // no sessionID
+    { type: "session.deleted", data: {} }, // no sessionID
+    { type: "session.step.failed", data: {} }, // no sessionID
+    { type: "permission.asked", data: { sessionID: "s1" } }, // no id
+    { type: "form.created", data: {} }, // no form
+    { type: "form.created", data: { form: {} } }, // form without id
+  ]
+  assert.deepEqual(events.map((event) => handleV2(core, event)), events.map(() => null))
 })
 
 // ─── Real OpenCode payload shapes (verified against opencode 1.18.x) ────────
@@ -788,4 +967,38 @@ test("plugin/sonido.ts and plugin/sonido-core.ts have not drifted", () => {
     new RegExp(`const VERSION = "${VERSION}"`),
     "plugin/sonido.ts must advertise the same version as plugin/sonido-core.ts",
   )
+})
+
+// ─── Entry contract (OpenCode 2.x loader) ───────────────────────────────────
+//
+// The entry cannot be imported here (OpenCode resolves "@opencode/plugin" from
+// its own install, not from this checkout), so its loader contract is asserted
+// on the source: 2.x rejects a plugin that is not a default-exported
+// Plugin.define() definition, and it rejects any extra export.
+
+const pluginEntrySource = readFileSync(
+  fileURLToPath(new URL("../plugin/sonido.ts", import.meta.url)),
+  "utf8",
+)
+
+test("the entry default-exports a Plugin.define() definition with an id and setup", () => {
+  assert.match(
+    pluginEntrySource,
+    /import\s*\{\s*Plugin\s*\}\s*from\s*"@opencode\/plugin"/,
+    "must import Plugin (a value, not a type) from @opencode/plugin",
+  )
+  assert.match(pluginEntrySource, /export default Plugin\.define\(\{/, "must default-export Plugin.define({ ... })")
+  assert.match(pluginEntrySource, /id:\s*"sonido"/, "the plugin definition must declare an id")
+  assert.match(pluginEntrySource, /setup/, "the plugin definition must declare a setup function")
+})
+
+test("the entry has no named exports", () => {
+  const named = pluginEntrySource.match(/^\s*export\s+(?!default\b)[^\s(]+/gm) ?? []
+  assert.deepEqual(named, [], "the OpenCode loader rejects a plugin with named exports")
+})
+
+test("the entry subscribes to the V2 event stream and registers the V2 hooks", () => {
+  assert.match(pluginEntrySource, /ctx\.event\.subscribe\(/, "must consume the async event stream")
+  assert.match(pluginEntrySource, /ctx\.tool\.hook\("execute\.after"/, "must register the tool hook")
+  assert.match(pluginEntrySource, /ctx\.session\.hook\("prompt"/, "must register the prompt hook")
 })

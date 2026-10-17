@@ -8,7 +8,7 @@ import { spawn } from "node:child_process"
 import { appendFileSync } from "node:fs"
 import { fileURLToPath } from "node:url"
 
-export const VERSION = "1.1.0"
+export const VERSION = "2.0.0"
 
 export type NotifyKind = "completion" | "response" | "attention" | "error"
 
@@ -109,6 +109,114 @@ function truncate(s: string, max: number): string {
   let cut = max - 1 // reserve room for the ellipsis
   while (cut > 0 && s.charCodeAt(cut - 1) >= 0xd800 && s.charCodeAt(cut - 1) <= 0xdbff) cut--
   return s.slice(0, cut) + "…"
+}
+
+// ─── V2 (OpenCode 2.x) → core translation ───────────────────────────────────
+
+/** Envelope delivered by ctx.event.subscribe() in OpenCode 2.x. */
+export interface V2Event {
+  type?: unknown
+  data?: unknown
+}
+
+/** An event in the `{ type, properties }` shape SonidoCore.handleEvent takes. */
+export interface CoreEvent {
+  type: string
+  properties: Record<string, unknown>
+}
+
+function asRecord(value: unknown): Record<string, any> {
+  return value !== null && typeof value === "object" ? (value as Record<string, any>) : {}
+}
+
+/** 2.x errors are `{ type, message, status? }`; the core reads `{ name, message }`. */
+function translateError(error: unknown): { name?: string; message?: string } {
+  const err = asRecord(error)
+  return { name: asString(err.type), message: asString(err.message) }
+}
+
+/**
+ * The question text for a form: the form title, else the first field's title or
+ * description. Returns undefined when the form carries no usable text.
+ */
+function formQuestionText(form: Record<string, any>): string | undefined {
+  const title = asString(form.title)
+  if (title) return title
+  const fields = Array.isArray(form.fields) ? form.fields : []
+  for (const field of fields) {
+    const f = asRecord(field)
+    const text = asString(f.title) ?? asString(f.description)
+    if (text) return text
+  }
+  return undefined
+}
+
+/**
+ * Translates one OpenCode 2.x event into the `{ type, properties }` contract
+ * handleEvent consumes. Returns null for every event Sonido has no behavior for.
+ */
+export function translateEvent(event: V2Event): CoreEvent | null {
+  const type = asString(event?.type)
+  if (!type) return null
+  const data = asRecord(event?.data)
+
+  switch (type) {
+    case "session.idle": {
+      const sessionID = asString(data.sessionID)
+      if (!sessionID) return null
+      return { type: "session.idle", properties: { sessionID } }
+    }
+    case "session.status": {
+      const sessionID = asString(data.sessionID)
+      if (!sessionID) return null
+      return { type: "session.status", properties: { sessionID, status: data.status } }
+    }
+    case "session.created": {
+      // 2.x carries the session record in `data` itself: `sessionID` is the
+      // created session, and `parentID` / `title` are optional.
+      const id = asString(data.sessionID)
+      if (!id) return null
+      return {
+        type: "session.created",
+        properties: { info: { id, parentID: data.parentID, title: data.title } },
+      }
+    }
+    case "session.deleted": {
+      const id = asString(data.sessionID)
+      if (!id) return null
+      return { type: "session.deleted", properties: { info: { id } } }
+    }
+    case "session.execution.failed":
+    case "session.step.failed": {
+      // 2.x replaced `session.error` with these two failure events.
+      const sessionID = asString(data.sessionID)
+      if (!sessionID) return null
+      return { type: "session.error", properties: { sessionID, error: translateError(data.error) } }
+    }
+    case "permission.asked": {
+      // 2.x calls the permission name `action` and its patterns `resources`.
+      const id = asString(data.id)
+      if (!id) return null
+      return {
+        type: "permission.asked",
+        properties: { id, sessionID: data.sessionID, permission: data.action, patterns: data.resources },
+      }
+    }
+    case "form.created": {
+      // 2.x renamed the question system to forms; the core's question.asked
+      // branch already renders the first question text.
+      const form = asRecord(data.form)
+      const id = asString(form.id)
+      if (!id) return null
+      const text = formQuestionText(form)
+      return {
+        type: "question.asked",
+        properties: { id, sessionID: form.sessionID, questions: text ? [{ question: text }] : [] },
+      }
+    }
+    default:
+      return null
+  }
 }
 
 // ─── Core (suppression + dedupe + rate limit + emit) ────────────────────────

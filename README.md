@@ -49,7 +49,8 @@ To confirm the install before relying on it, run the `-DryRun` smoke test in
 | Requirement | Detail |
 |---|---|
 | OS | Windows 10/11 (tested on Windows 11) |
-| OpenCode | 1.18.x (plugin loads into `~/.config/opencode/plugins`) |
+| OpenCode | **2.0.x** — verified against OpenCode 2.0.30 and `@opencode/plugin` 2.0.4 (the plugin loads into `~/.config/opencode/plugins`) |
+| OpenCode (unmaintained) | 1.x is **not** supported: Sonido 2.0.0 speaks the 2.x plugin API (`Plugin.define`, `ctx.event.subscribe()`). Use Sonido 1.1.0 with OpenCode 1.18.x. |
 | Shell | Windows PowerShell 5.1 (`powershell.exe`, built in) — required for WinRT toasts; pwsh 7 is not used |
 | Runtime | Node 22.18+ only for running the tests; the plugin itself has **zero** runtime dependencies |
 
@@ -64,20 +65,20 @@ processes, and a notification failure can never affect OpenCode.
 
 | OpenCode hook | What Sonido observes |
 |---|---|
-| `event` | `session.idle` / `session.status`, `session.error`, `permission.asked`, `question.asked`, `todo.updated`, `session.created` / `session.deleted` |
-| `chat.message` | Clears a pending task-completion flag (an ordinary reply, not a phase end) |
-| `tool.execute.after` | `task`, `todowrite`, `sdd-*`, `mem_session_summary`, `mem_session_end` — marks the session as a planned-task completion |
+| `ctx.event.subscribe()` | `session.idle` / `session.status`, `session.execution.failed`, `session.step.failed`, `permission.asked`, `form.created`, `session.created` / `session.deleted` |
+| `ctx.session.hook("prompt")` | Clears a pending task-completion flag (an ordinary reply, not a phase end) |
+| `ctx.tool.hook("execute.after")` | `task`, `todowrite`, `sdd-*`, `mem_session_summary`, `mem_session_end` — marks the session as a planned-task completion |
 
 ### When each sound plays
 
 - **`response.wav`** — a top-level session went idle (or reported `status:
   idle`) with no task-completion flag: OpenCode simply finished answering.
-- **`attention.wav`** — OpenCode emitted `permission.asked` or `question.asked`:
+- **`attention.wav`** — OpenCode emitted `permission.asked` or `form.created`:
   it needs your approval or your input. A toast carries the detail.
 - **`completion.wav`** — a session went idle *and* a planned-task signal was
   seen for it.
-- **`error.wav`** — `session.error`: OpenCode hit an error. A toast carries the
-  error name and message.
+- **`error.wav`** — `session.execution.failed` or `session.step.failed`:
+  OpenCode hit an error. A toast carries the error name and message.
 
 ### How the completion flag works
 
@@ -86,11 +87,13 @@ The flag is set when any of these runs for the session:
 - the `task` tool
 - an `sdd-*` tool, `mem_session_summary`, or `mem_session_end`
 - `todowrite`, reporting every todo as `completed` or `cancelled`
-- a `todo.updated` event where every todo is `completed` or `cancelled`
 
 The flag is consumed by the next idle event (that idle becomes `completion.wav`
-instead of `response.wav`) and is cleared by `chat.message` and
-`session.deleted`.
+instead of `response.wav`) and is cleared by the `prompt` hook (an ordinary
+reply) and by `session.deleted`.
+
+> OpenCode 2.x removed the `todo.updated` event, so `todowrite` is observed
+> through the tool hook instead.
 
 ### Toasts
 
@@ -110,12 +113,11 @@ title.
 ### Safeguards
 
 - **Subagent silence**: parent/child relationships are tracked from
-  `session.created` metadata (`properties.info.parentID`). Responses and
-  completions from subagent sessions are suppressed; only top-level sessions
-  alert.
+  `session.created` (`data.parentID` / `data.title`). Responses and completions
+  from subagent sessions are suppressed; only top-level sessions alert.
 - **No duplicate sounds**: `session.idle` and `session.status` share one dedupe
   key per session (2 s window), so the same completion never beeps twice.
-  Permission/question events are deduped by their event id (1 h window);
+  Permission and form events are deduped by their event id (1 h window);
   errors are deduped per session (5 s window).
 - **Rate limiting**: at most 12 notifications per minute, at least 400 ms apart.
 - **Bounded memory**: dedupe table (max 500 entries) and session table (max 200)
@@ -164,7 +166,7 @@ the matching project checkout — the installer overwrites only the Sonido files
 |---|---|
 | No sound at all | An active audio device is required. Run the smoke test below. |
 | No toast (sound still plays) | Focus Assist / Do Not Disturb suppresses Windows toasts. |
-| Nothing happens | Confirm the plugin loaded: restart OpenCode, then look for the `SonidoPlugin initialized v1.1.0` line in the plugin log (see below). |
+| Nothing happens | Confirm the plugin loaded: restart OpenCode, then look for the `SonidoPlugin initialized v2.0.0` line in the plugin log (see below). |
 | Plugin not loading | Verify the files are in `~/.config/opencode/plugins` and restart OpenCode. |
 | A sound is missing | Confirm all four `.wav` files are present; a missing file falls back to a system sound. |
 
@@ -198,16 +200,18 @@ powershell.exe -NoProfile -File plugin\sonido-notify.ps1 -Kind completion
 ## Architecture
 
 ```
-OpenCode hooks ──► SonidoCore ──► createNotifier ──► powershell.exe (5.1)
-(event, chat.message,   classify / suppress /      ──► fixed sonido-notify.ps1
- tool.execute.after)    dedupe / rate-limit            ──► <kind>.wav
-                                                       ──► system sound
-                                                       ──► toast
+OpenCode 2.x hooks ──► translateEvent ──► SonidoCore ──► createNotifier ──► powershell.exe (5.1)
+(ctx.event.subscribe /       V2 data ->        classify / suppress /        ──► fixed sonido-notify.ps1
+ ctx.session.hook("prompt")  { type,          dedupe / rate-limit          ──► <kind>.wav
+ ctx.tool.hook("execute.after")) properties)                                ──► system sound
+                                                                            ──► toast
 ```
 
-- `plugin/sonido.ts` — the OpenCode plugin entry point. It must export **only**
-  a default function: OpenCode's loader throws when it finds any other export,
-  so the whole engine is inlined here and the file imports nothing local.
+- `plugin/sonido.ts` — the OpenCode plugin entry point. It must default-export
+  **only** a `Plugin.define({ id, setup })` definition: the 2.x loader rejects a
+  plugin with any other export, so the whole engine is inlined here and the file
+  imports nothing local. The entry translates the 2.x `{ type, data }` events
+  into the core's `{ type, properties }` contract before handing them over.
 - `plugin/sonido-core.ts` — the same engine, exported for the tests. It is
   intentionally a duplicate, and it is never installed. A drift-guard test fails
   if the two copies diverge.
@@ -233,11 +237,13 @@ node --test tests/sonido.test.ts
 
 The suite covers classification, subagent suppression, deduplication, rate
 limiting, memory bounds, failure isolation, the spawn contract, the
-notifier/renderer boundary, and drift between the two engine copies.
+notifier/renderer boundary, the 2.x-to-core event translation, the entry's
+loader contract, and drift between the two engine copies.
 
-The plugin's `import type { Plugin } from "@opencode-ai/plugin"` is type-only and
-erased at runtime, so the tests never need `npm install`. If you want editor
-type hints, `npm i -D @opencode-ai/plugin typescript` enables them.
+The entry's `import { Plugin } from "@opencode/plugin"` resolves from OpenCode's
+own dependency tree at runtime, so the test suite never imports the entry and
+never needs `npm install` (the tests assert its loader contract on the source).
+For editor type hints, `npm i -D @opencode/plugin typescript` enables them.
 
 ## License
 
