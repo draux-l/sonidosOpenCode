@@ -4,6 +4,7 @@ node_modules/
 # Runtime artifacts and logs
 *.log
 sonido.log
+sonido-claim.json
 
 # OpenCode local state
 .opencode/

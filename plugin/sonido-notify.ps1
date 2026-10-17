@@ -1,15 +1,12 @@
 # sonido-notify.ps1 — fixed notification renderer for the Sonido OpenCode plugin.
 #
 # Contract:
-#   - Designed for Windows PowerShell 5.1 (powershell.exe). WinRT toast types
-#     are NOT available in pwsh 7, so this script must run under powershell.exe.
-#   - All dynamic content arrives as Base64(UTF-8) and is decoded here. Event
-#     text is never interpolated into executable code; toast text is assigned
-#     through the XML DOM (InnerText), which escapes it safely.
-#   - Each kind maps to its own sound file (<kind>.wav) and plays it once.
-#   - response/completion -> sound only.
-#   - attention/error -> Windows toast (custom AUMID) + sound; the toast failure
-#     path falls back to the sound alone.
+#   - This is the FALLBACK renderer. Sonido normally plays its sounds inside
+#     OpenCode's own process (bun:ffi + winmm); this script only runs when that
+#     backend is unavailable.
+#   - Designed for Windows PowerShell 5.1 (powershell.exe).
+#   - Sound only by design: no toasts. Each kind maps to its own sound file
+#     (<kind>.wav) and plays it once, falling back to a Windows system sound.
 #   - Always exits 0: a notification failure must never surface anywhere.
 #
 # Usage:
@@ -30,8 +27,6 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-
-$AUMID = "Sonido.OpenCode"
 
 function Decode-B64Value {
     param([string]$Value)
@@ -62,31 +57,6 @@ function Invoke-SonidoSound {
     $sound.Play()
 }
 
-function Show-SonidoToast {
-    param([string]$ToastTitle, [string]$ToastBody)
-    try {
-        # WinRT activation support for Windows PowerShell 5.1.
-        Add-Type -AssemblyName System.Runtime.WindowsRuntime -ErrorAction Stop
-        $null = [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime]
-        $null = [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime]
-
-        $xml = New-Object Windows.Data.Xml.Dom.XmlDocument
-        $xml.LoadXml("<toast><visual><binding template='ToastGeneric'><text></text><text></text></binding></visual></toast>")
-        $texts = $xml.GetElementsByTagName("text")
-        # InnerText performs safe XML escaping; never build XML by string concatenation.
-        $texts.Item(0).InnerText = $ToastTitle
-        $texts.Item(1).InnerText = $ToastBody
-
-        $toast = New-Object Windows.UI.Notifications.ToastNotification -ArgumentList $xml
-        $notifier = [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($AUMID)
-        $notifier.Show($toast)
-        return $true
-    }
-    catch {
-        return $false
-    }
-}
-
 try {
     $title = Decode-B64Value -Value $TitleB64
     $body = Decode-B64Value -Value $BodyB64
@@ -96,15 +66,8 @@ try {
         exit 0
     }
 
-    if ($Kind -eq "completion" -or $Kind -eq "response") {
-        # Completion and response are sound-only by design.
-        Invoke-SonidoSound -SoundKind $Kind
-    }
-    else {
-        # Attention/error: show toast for visual details and always play sound for the audio alert.
-        $null = Show-SonidoToast -ToastTitle $title -ToastBody $body
-        Invoke-SonidoSound -SoundKind $Kind
-    }
+    # Sound only by design: every kind plays its own file once.
+    Invoke-SonidoSound -SoundKind $Kind
 }
 catch {
     # Last-resort fallback: sound, then a clean exit. Never propagate.

@@ -8,7 +8,8 @@
  */
 import { Plugin } from "@opencode/plugin"
 import { spawn } from "node:child_process"
-import { appendFileSync } from "node:fs"
+import { appendFileSync, readFileSync, writeFileSync } from "node:fs"
+import { join } from "node:path"
 import { fileURLToPath } from "node:url"
 
 const VERSION = "2.0.0"
@@ -19,6 +20,10 @@ interface Notification {
   kind: NotifyKind
   title: string
   body: string
+  /** Identity of the event that produced this notification (cross-instance claim). */
+  dedupeKey?: string
+  /** Session that produced it, when the event carries one (cross-instance claim). */
+  sessionID?: string
 }
 
 interface Candidate extends Notification {
@@ -170,6 +175,14 @@ function translateEvent(event: V2Event): CoreEvent | null {
       const id = asString(data.sessionID)
       if (!id) return null
       return { type: "session.deleted", properties: { info: { id } } }
+    }
+    case "session.execution.succeeded": {
+      // One of these per turn when the assistant finishes. Mapping it onto
+      // session.idle reuses the response classification and its per-session
+      // dedupe key, so a succeeded+idle pair never plays two sounds.
+      const sessionID = asString(data.sessionID)
+      if (!sessionID) return null
+      return { type: "session.idle", properties: { sessionID } }
     }
     case "session.execution.failed":
     case "session.step.failed": {
@@ -323,6 +336,8 @@ class SonidoCore {
         kind: cand.kind,
         title: truncate(cand.title, 64),
         body: truncate(body, 240),
+        dedupeKey: cand.dedupeKey,
+        sessionID: cand.sessionID,
       }
 
       this.log(`emitting notification: kind=${notification.kind} title=${notification.title}`)
@@ -527,6 +542,96 @@ class SonidoCore {
   }
 }
 
+// ─── Zero-process audio backend ─────────────────────────────────────────────
+
+/** Plays a WAV file and reports whether it started. Never spawns a process. */
+type SoundPlayer = (wavPath: string) => boolean
+
+/**
+ * Bun can call Windows APIs directly, so playing a sound needs no child process
+ * at all: winmm's PlaySoundW reads the WAV inside OpenCode's own process.
+ *
+ * Loaded lazily and fully guarded. Under Node (the test runner) `bun:ffi` does
+ * not exist, and a runtime that forbids FFI must degrade to the PowerShell
+ * renderer rather than go silent. Returning null means "use the fallback".
+ */
+async function loadFfiSoundPlayer(opts: { log: (msg: string) => void }): Promise<SoundPlayer | null> {
+  try {
+    const ffi: any = await import("bun:ffi")
+    const winmm = ffi.dlopen("winmm.dll", {
+      PlaySoundW: {
+        args: [ffi.FFIType.ptr, ffi.FFIType.ptr, ffi.FFIType.u32],
+        returns: ffi.FFIType.bool,
+      },
+    })
+    const SND_ASYNC = 0x0001
+    const SND_NODEFAULT = 0x0002
+    const SND_FILENAME = 0x0002_0000
+    const FLAGS = SND_FILENAME | SND_ASYNC | SND_NODEFAULT
+    // SND_ASYNC returns before playback ends, so the filename buffer must stay
+    // reachable; keep the last few alive and let the rest be collected.
+    opts.log("in-process audio ready (bun:ffi + winmm)")
+    const alive: Buffer[] = []
+    return (wavPath: string): boolean => {
+      try {
+        const wide = Buffer.from(wavPath + "\0", "utf16le")
+        alive.push(wide)
+        if (alive.length > 8) alive.shift()
+        return winmm.symbols.PlaySoundW(ffi.ptr(wide), null, FLAGS) !== false
+      } catch (err: any) {
+        opts.log(`ffi PlaySound failed: ${err?.message || err}`)
+        return false
+      }
+    }
+  } catch (err: any) {
+    opts.log(`bun:ffi unavailable, falling back to the PowerShell renderer: ${err?.message || err}`)
+    return null
+  }
+}
+
+// ─── Cross-instance play claim ──────────────────────────────────────────────
+
+/** Default slot TTL: one sound per session per this window, across instances. */
+const PLAY_CLAIM_TTL_MS = 1_500
+
+/**
+ * OpenCode reconciles and reloads local plugins constantly and does not always
+ * dispose the previous instance, so several plugin instances can be live at the
+ * same time. Every live instance classifies the same event on its own, which
+ * turned one notification into one sound per live instance (observed: ten).
+ *
+ * This claim is the arbiter between instances: the first to claim a slot plays
+ * it, everyone else skips. It is file-backed because concurrently live
+ * instances are not guaranteed to share module state.
+ *
+ * The slot is the session (falling back to the event key) so that two instances
+ * which classified the same event differently cannot both play.
+ */
+function createPlayClaim(opts: { path: string; nowMs?: () => number }) {
+  const nowMs = opts.nowMs ?? Date.now
+  return (slot: string, ttlMs: number = PLAY_CLAIM_TTL_MS): boolean => {
+    const now = nowMs()
+    let state: Record<string, number> = {}
+    try {
+      const parsed = JSON.parse(readFileSync(opts.path, "utf8"))
+      if (parsed && typeof parsed === "object") state = parsed as Record<string, number>
+    } catch {
+      // Missing or corrupt claim file: start from an empty state.
+    }
+    for (const [key, ts] of Object.entries(state)) {
+      if (typeof ts !== "number" || now - ts >= ttlMs) delete state[key]
+    }
+    if (slot in state) return false
+    state[slot] = now
+    try {
+      writeFileSync(opts.path, JSON.stringify(state))
+    } catch {
+      // If the claim cannot be persisted, play anyway: a sound beats silence.
+    }
+    return true
+  }
+}
+
 function b64(value: string): string {
   return Buffer.from(value, "utf8").toString("base64")
 }
@@ -536,6 +641,12 @@ interface NotifierOptions {
   powershellPath?: string
   log?: (msg: string) => void
   spawnFn?: (cmd: string, args: string[], opts: Record<string, unknown>) => { unref?: () => void }
+  /** Cross-instance arbiter; when supplied, only its winner spawns a sound. */
+  claim?: (slot: string, ttlMs?: number) => boolean
+  /** Zero-process player; when it starts the sound, no child process is spawned. */
+  playSound?: SoundPlayer
+  /** Directory holding the <kind>.wav files. */
+  audioDir?: string
 }
 
 function createNotifier(opts: NotifierOptions): (n: Notification) => void {
@@ -548,6 +659,21 @@ function createNotifier(opts: NotifierOptions): (n: Notification) => void {
       if (!scriptPath) {
         log("notify script path unavailable; dropping notification")
         return
+      }
+      if (opts.claim) {
+        const slot = n.sessionID ?? n.dedupeKey
+        if (slot && !opts.claim(slot)) {
+          log(`skipped by the cross-instance claim: ${slot}`)
+          return
+        }
+      }
+      if (opts.playSound && opts.audioDir) {
+        const wav = join(opts.audioDir, `${n.kind}.wav`)
+        if (opts.playSound(wav)) {
+          log(`played ${n.kind}.wav in process, no child process spawned`)
+          return
+        }
+        log(`in-process playback failed for ${n.kind}; using the PowerShell renderer`)
       }
       const args = [
         "-NoProfile",
@@ -593,11 +719,37 @@ function resolveScriptPath(moduleURL: string): string {
   return ""
 }
 
+/** Resolves the sibling cross-instance claim file next to this module. */
+function resolveClaimPath(moduleURL: string): string {
+  try {
+    const p = fileURLToPath(new URL("sonido-claim.json", moduleURL))
+    if (p) return p
+  } catch {
+  }
+  return ""
+}
+
+/** Resolves the directory that holds this module's <kind>.wav files. */
+function resolveAudioDir(moduleURL: string): string {
+  try {
+    const p = fileURLToPath(new URL(".", moduleURL))
+    if (p) return p
+  } catch {
+  }
+  return ""
+}
+
 export default Plugin.define({
   id: "sonido",
   async setup(ctx) {
+    const playSound = await loadFfiSoundPlayer({ log: defaultLog })
     const core = new SonidoCore({
-      notify: createNotifier({ scriptPath: resolveScriptPath(import.meta.url) }),
+      notify: createNotifier({
+        scriptPath: resolveScriptPath(import.meta.url),
+        audioDir: resolveAudioDir(import.meta.url),
+        playSound: playSound ?? undefined,
+        claim: createPlayClaim({ path: resolveClaimPath(import.meta.url) }),
+      }),
     })
     defaultLog("SonidoPlugin initialized v" + VERSION)
 

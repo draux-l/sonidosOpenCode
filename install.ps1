@@ -42,7 +42,7 @@ $InstalledNames = @(
 )
 
 # Runtime artifacts created by the plugin itself; removed on uninstall only.
-$RuntimeArtifacts = @("sonido.log")
+$RuntimeArtifacts = @("sonido.log", "sonido-claim.json")
 
 function Write-Step {
     param([string]$Message)

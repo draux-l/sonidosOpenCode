@@ -16,21 +16,29 @@
  *   - non-blocking / failure isolation (notifications never throw)
  *   - safe spawn contract (detached, unref'd, base64 payload, fixed script)
  *   - cross-boundary contract: the real PowerShell renderer accepts the notifier's args
+ *   - cross-instance claim: N live plugin instances produce one sound, not N
  *   - no logic drift between plugin/sonido.ts and plugin/sonido-core.ts
  */
 import { test } from "node:test"
 import assert from "node:assert/strict"
 import { spawnSync } from "node:child_process"
-import { readFileSync } from "node:fs"
+import { readFileSync, writeFileSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 import { fileURLToPath } from "node:url"
 import {
   VERSION,
   DEFAULT_LIMITS,
   SonidoCore,
   createNotifier,
+  createPlayClaim,
+  loadFfiSoundPlayer,
+  resolveAudioDir,
+  resolveClaimPath,
   resolveScriptPath,
   resolveLogPath,
   translateEvent,
+  PLAY_CLAIM_TTL_MS,
   type Notification,
 } from "../plugin/sonido-core.ts"
 
@@ -301,6 +309,31 @@ test("V2 session.status idle translates to the response sound", () => {
   const n = handleV2(core, v2Event("session.status", { sessionID: "s1", status: { type: "idle" } }))
   assert.ok(n)
   assert.equal(n!.kind, "response")
+})
+
+test("V2 session.execution.succeeded translates to the response sound", () => {
+  const core = new SonidoCore({ log: noopLog })
+  const n = handleV2(core, v2Event("session.execution.succeeded", { sessionID: "s1" }))
+  assert.ok(n)
+  assert.equal(n!.kind, "response")
+  assert.equal(n!.title, "Response ready")
+})
+
+test("V2 session.execution.succeeded is a completion when the session is task-flagged", () => {
+  const core = new SonidoCore({ log: noopLog })
+  core.onToolExecute("s1", "task")
+  const n = handleV2(core, v2Event("session.execution.succeeded", { sessionID: "s1" }))
+  assert.ok(n)
+  assert.equal(n!.kind, "completion")
+})
+
+test("V2 session.execution.succeeded and session.idle share one dedupe key per session", () => {
+  const core = new SonidoCore({ log: noopLog, limits: permissiveLimits })
+  const a = handleV2(core, v2Event("session.execution.succeeded", { sessionID: "s1" }))
+  assert.ok(a)
+  assert.equal(a!.kind, "response")
+  // The turn-finished signal must not double-beep when idle also fires.
+  assert.equal(handleV2(core, v2Event("session.idle", { sessionID: "s1" })), null)
 })
 
 test("V2 session.created learns the session id, parentID and title from data", () => {
@@ -924,7 +957,7 @@ function normalizeSource(source: string): string[] {
   return source
     .replace(/\/\*[\s\S]*?\*\//g, "")
     .replace(/\/\/.*$/gm, "")
-    .replace(/^\s*export\s+/gm, "")
+    .replace(/^[ \t]*export[ \t]+/gm, "")
     .split("\n")
     .map((line) => line.trim())
     .filter((line) => line.length > 0)
@@ -1001,4 +1034,155 @@ test("the entry subscribes to the V2 event stream and registers the V2 hooks", (
   assert.match(pluginEntrySource, /ctx\.event\.subscribe\(/, "must consume the async event stream")
   assert.match(pluginEntrySource, /ctx\.tool\.hook\("execute\.after"/, "must register the tool hook")
   assert.match(pluginEntrySource, /ctx\.session\.hook\("prompt"/, "must register the prompt hook")
+})
+
+// ─── Cross-instance play claim ──────────────────────────────────────────────
+//
+// OpenCode reconciles and reloads local plugins constantly and does not always
+// dispose the previous instance, so several instances of this plugin can be
+// live at once. Every instance classifies the same event on its own, which on a
+// real OpenCode 2.0.30 install turned one notification into TEN PowerShell
+// processes. The claim makes exactly one instance play.
+
+let claimSeq = 0
+
+/** Every test gets its own file in the OS temp dir; the repo tree stays clean. */
+function tempClaimPath(): string {
+  claimSeq++
+  return join(tmpdir(), `sonido-claim-test-${process.pid}-${claimSeq}.json`)
+}
+
+test("the play claim grants a slot once and refuses it again within the TTL", () => {
+  let now = 1_000_000
+  const claim = createPlayClaim({ path: tempClaimPath(), nowMs: () => now })
+  assert.equal(claim("ses_1"), true, "the first claimant wins")
+  assert.equal(claim("ses_1"), false, "a second instance must not replay the same slot")
+  assert.equal(claim("ses_2"), true, "a different slot is independent")
+  now += PLAY_CLAIM_TTL_MS + 1
+  assert.equal(claim("ses_1"), true, "the slot frees up after the TTL")
+})
+
+test("the play claim never blocks the sound when its file is missing or corrupt", () => {
+  const path = tempClaimPath()
+  const claim = createPlayClaim({ path })
+  assert.equal(claim("ses_1"), true, "a missing claim file must still play")
+  writeFileSync(path, "{ this is not json")
+  assert.equal(claim("ses_2"), true, "a corrupt claim file must still play")
+})
+
+test("ten live plugin instances of one event produce exactly one sound", () => {
+  const captures: CapturedSpawn[] = []
+  const claim = createPlayClaim({ path: tempClaimPath() })
+
+  // Ten independent cores, each with its own dedupe map: this is what a real
+  // install looks like after OpenCode has leaked plugin instances.
+  const instances = Array.from(
+    { length: 10 },
+    () =>
+      new SonidoCore({
+        log: noopLog,
+        limits: permissiveLimits,
+        notify: createNotifier({
+          scriptPath: "C:\\scripts\\sonido-notify.ps1",
+          spawnFn: fakeSpawn(captures),
+          log: noopLog,
+          claim,
+        }),
+      }),
+  )
+
+  for (const core of instances) {
+    core.handleEvent({ type: "session.idle", properties: { sessionID: "ses_shared" } })
+  }
+
+  assert.equal(
+    captures.length,
+    1,
+    "one event must spawn exactly one PowerShell, not one per live instance",
+  )
+})
+
+test("the notifier does not spawn when another instance already claimed the slot", () => {
+  const captures: CapturedSpawn[] = []
+  const notify = createNotifier({
+    scriptPath: "C:\\scripts\\sonido-notify.ps1",
+    spawnFn: fakeSpawn(captures),
+    log: noopLog,
+    claim: () => false,
+  })
+  notify({ kind: "response", title: "T", body: "B", sessionID: "ses_lost" })
+  assert.equal(captures.length, 0, "a lost claim must not spawn a process")
+})
+
+test("the notifier still plays when no claim is configured", () => {
+  const captures: CapturedSpawn[] = []
+  const notify = createNotifier({
+    scriptPath: "C:\\scripts\\sonido-notify.ps1",
+    spawnFn: fakeSpawn(captures),
+    log: noopLog,
+  })
+  notify({ kind: "response", title: "T", body: "B", sessionID: "ses_solo" })
+  assert.equal(captures.length, 1, "without a claim every notification plays as before")
+})
+
+test("resolveClaimPath points at the sibling claim file", () => {
+  const p = resolveClaimPath("file:///C:/proj/plugin/sonido.ts")
+  assert.ok(p.endsWith("sonido-claim.json"), p)
+  assert.ok(p.includes("plugin"), p)
+})
+
+// ─── Zero-process audio backend ─────────────────────────────────────────────
+//
+// The sound is played by winmm through bun:ffi, inside OpenCode's own process,
+// so no PowerShell is ever created. Node (this runner) has no bun:ffi, so the
+// loader must report "unavailable" and let the notifier fall back — never throw
+// and never go silent.
+
+test("loadFfiSoundPlayer reports unavailable instead of throwing off-Bun", async () => {
+  const logged: string[] = []
+  const player = await loadFfiSoundPlayer({ log: (msg) => logged.push(msg) })
+  assert.equal(player, null, "Node has no bun:ffi, so the loader must yield null")
+  assert.ok(logged.length >= 1, "the fallback must be logged, not swallowed")
+})
+
+test("the notifier plays in process and spawns nothing when the player succeeds", () => {
+  const captures: CapturedSpawn[] = []
+  const played: string[] = []
+  const notify = createNotifier({
+    scriptPath: "C:\\scripts\\sonido-notify.ps1",
+    audioDir: "C:\\plugins",
+    playSound: (wav) => {
+      played.push(wav)
+      return true
+    },
+    spawnFn: fakeSpawn(captures),
+    log: noopLog,
+  })
+
+  notify({ kind: "attention", title: "T", body: "B", sessionID: "ses_x" })
+
+  assert.equal(captures.length, 0, "no child process when the in-process player works")
+  assert.equal(played.length, 1, "the in-process player must be asked exactly once")
+  assert.ok(played[0].endsWith("attention.wav"), played[0])
+})
+
+test("the notifier falls back to spawning when in-process playback fails", () => {
+  const captures: CapturedSpawn[] = []
+  const notify = createNotifier({
+    scriptPath: "C:\\scripts\\sonido-notify.ps1",
+    audioDir: "C:\\plugins",
+    playSound: () => false,
+    spawnFn: fakeSpawn(captures),
+    log: noopLog,
+  })
+
+  notify({ kind: "completion", title: "T", body: "B", sessionID: "ses_y" })
+
+  assert.equal(captures.length, 1, "a failed in-process play must still make a sound")
+})
+
+test("resolveAudioDir points at the module directory, not the module file", () => {
+  const p = resolveAudioDir("file:///C:/proj/plugin/sonido.ts")
+  assert.ok(p.includes("plugin"), p)
+  assert.ok(!p.includes("sonido.ts"), p)
 })
